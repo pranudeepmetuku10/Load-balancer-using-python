@@ -131,10 +131,49 @@ no healthy backends
 
 Kill one backend process directly (Ctrl-C in its terminal) without toggling, then send a request that happens to be routed to it. The LB returns `502 bad gateway` and marks that backend unhealthy so subsequent requests skip it until it comes back.
 
+### 7. Try the other strategies
+
+**Weighted round robin.** The default `BACKENDS` config in `lb.py` assigns weights `1, 2, 3` to ports `9001, 9002, 9003`. Restart the LB with:
+
+```bash
+python lb.py --strategy weighted
+```
+
+Send 60 requests and count where they landed:
+
+```bash
+for i in $(seq 1 60); do curl -s localhost:8080/; done | sort | uniq -c
+```
+
+Expected: roughly `10 :9001`, `20 :9002`, `30 :9003` (a 1:2:3 split).
+
+**Least connections.** This one is most visible when requests have uneven durations. Add an artificial delay to one backend by editing `backend.py` (or just stop one), then start:
+
+```bash
+python lb.py --strategy least-connections
+```
+
+Fire concurrent requests and watch the LB pick whichever backend currently has the fewest in-flight requests:
+
+```bash
+seq 1 30 | xargs -n1 -P10 curl -s localhost:8080/ > /tmp/lb.out
+sort /tmp/lb.out | uniq -c
+```
+
+## Strategies
+
+| Name                | CLI flag                          | When to use                                                                 |
+| ------------------- | --------------------------------- | --------------------------------------------------------------------------- |
+| Round robin         | `--strategy round-robin` (default) | Backends are homogeneous and request durations are similar.                |
+| Least connections   | `--strategy least-connections`    | Request durations vary - long requests would imbalance round robin.         |
+| Weighted round robin | `--strategy weighted`            | Backends are heterogeneous (different CPU/RAM). Set weights in `BACKENDS`.  |
+
+Weighted uses nginx's "smooth" WRR algorithm, so a 1:2:3 weighting produces an interleaved sequence (e.g. `C, B, C, A, B, C, ...`) rather than a bursty `A, B, B, C, C, C` pattern.
+
 ## Configuration
 
 Edit the constants at the top of `lb.py`:
 
 - `LISTEN_HOST`, `LISTEN_PORT` - where the LB listens
-- `BACKENDS` - list of upstream URLs
+- `BACKENDS` - list of `(url, weight)` tuples; weight is only used by `--strategy weighted`
 - `HEALTH_PATH`, `HEALTH_INTERVAL`, `HEALTH_TIMEOUT` - probing behavior
