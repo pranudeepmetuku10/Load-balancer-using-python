@@ -1,25 +1,31 @@
-"""Simple HTTP reverse-proxy load balancer.
+"""HTTP reverse-proxy load balancer.
 
-Strategy:    round robin over healthy backends
+Strategies:  round-robin | least-connections | weighted (smooth WRR)
 Health:      active probing of /health every HEALTH_INTERVAL seconds
-Run:         python lb.py
+Run:         python lb.py --strategy round-robin
+             python lb.py --strategy least-connections
+             python lb.py --strategy weighted
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
-import itertools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Protocol
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8080
-BACKENDS = [
-    "http://localhost:9001",
-    "http://localhost:9002",
-    "http://localhost:9003",
+
+# (url, weight). Weight is used only by the weighted strategy; ignored otherwise.
+BACKENDS: list[tuple[str, int]] = [
+    ("http://localhost:9001", 1),
+    ("http://localhost:9002", 2),
+    ("http://localhost:9003", 3),
 ]
+
 HEALTH_PATH = "/health"
 HEALTH_INTERVAL = 5.0
 HEALTH_TIMEOUT = 2.0
@@ -36,20 +42,76 @@ log = logging.getLogger("lb")
 @dataclass
 class Backend:
     url: str
+    weight: int = 1
     healthy: bool = True
+    active: int = 0          # in-flight requests, used by least-connections
+    _cw: int = field(default=0, repr=False)  # current weight, used by smooth WRR
+
+
+class Strategy(Protocol):
+    def pick(self) -> Backend | None: ...
 
 
 class RoundRobin:
     def __init__(self, backends: list[Backend]) -> None:
         self.backends = backends
-        self._cycle = itertools.cycle(backends)
+        self._idx = 0
 
     def pick(self) -> Backend | None:
-        for _ in range(len(self.backends)):
-            b = next(self._cycle)
+        n = len(self.backends)
+        for _ in range(n):
+            b = self.backends[self._idx % n]
+            self._idx += 1
             if b.healthy:
                 return b
         return None
+
+
+class LeastConnections:
+    def __init__(self, backends: list[Backend]) -> None:
+        self.backends = backends
+
+    def pick(self) -> Backend | None:
+        healthy = [b for b in self.backends if b.healthy]
+        if not healthy:
+            return None
+        # Tie-break by url so the choice is deterministic when counts are equal.
+        return min(healthy, key=lambda b: (b.active, b.url))
+
+
+class WeightedRoundRobin:
+    """Smooth weighted round robin (the algorithm nginx uses).
+
+    On each pick: every healthy backend's current weight grows by its configured
+    weight; the largest current weight wins and is then decreased by the total
+    weight of healthy backends. Distribution converges to the weight ratios
+    without bursty batching.
+    """
+
+    def __init__(self, backends: list[Backend]) -> None:
+        self.backends = backends
+
+    def pick(self) -> Backend | None:
+        total = 0
+        best: Backend | None = None
+        for b in self.backends:
+            if not b.healthy:
+                continue
+            b._cw += b.weight
+            total += b.weight
+            if best is None or b._cw > best._cw:
+                best = b
+        if best is None:
+            return None
+        best._cw -= total
+        return best
+
+
+STRATEGIES: dict[str, type[Strategy]] = {
+    "round-robin": RoundRobin,
+    "least-connections": LeastConnections,
+    "weighted": WeightedRoundRobin,
+}
 
 
 async def health_loop(backends: list[Backend], session: ClientSession) -> None:
@@ -71,7 +133,7 @@ async def _probe(backend: Backend, session: ClientSession, timeout: ClientTimeou
 
 
 async def proxy(request: web.Request) -> web.StreamResponse:
-    balancer: RoundRobin = request.app["balancer"]
+    balancer: Strategy = request.app["balancer"]
     session: ClientSession = request.app["session"]
 
     backend = balancer.pick()
@@ -82,6 +144,7 @@ async def proxy(request: web.Request) -> web.StreamResponse:
     target = backend.url + request.rel_url.raw_path_qs
     body = await request.read()
 
+    backend.active += 1
     try:
         async with session.request(
             request.method, target, headers=headers, data=body, allow_redirects=False,
@@ -97,6 +160,8 @@ async def proxy(request: web.Request) -> web.StreamResponse:
         log.warning("upstream error from %s: %s", backend.url, e)
         backend.healthy = False
         return web.Response(status=502, text=f"bad gateway: {e}")
+    finally:
+        backend.active -= 1
 
 
 async def on_startup(app: web.Application) -> None:
@@ -113,17 +178,31 @@ async def on_cleanup(app: web.Application) -> None:
     await app["session"].close()
 
 
-def build_app() -> web.Application:
-    backends = [Backend(url) for url in BACKENDS]
+def build_app(strategy_name: str = "round-robin") -> web.Application:
+    backends = [Backend(url=url, weight=w) for url, w in BACKENDS]
+    strategy_cls = STRATEGIES[strategy_name]
     app = web.Application()
     app["backends"] = backends
-    app["balancer"] = RoundRobin(backends)
+    app["balancer"] = strategy_cls(backends)
+    app["strategy_name"] = strategy_name
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     app.router.add_route("*", "/{tail:.*}", proxy)
     return app
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Simple HTTP load balancer.")
+    p.add_argument("--strategy", choices=sorted(STRATEGIES), default="round-robin",
+                   help="Load-balancing strategy (default: round-robin).")
+    p.add_argument("--host", default=LISTEN_HOST)
+    p.add_argument("--port", type=int, default=LISTEN_PORT)
+    return p.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    web.run_app(build_app(), host=LISTEN_HOST, port=LISTEN_PORT)
+    log.info("starting LB on %s:%d  strategy=%s  backends=%s",
+             args.host, args.port, args.strategy, [(u, w) for u, w in BACKENDS])
+    web.run_app(build_app(args.strategy), host=args.host, port=args.port, print=None)
