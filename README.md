@@ -2,7 +2,7 @@
 
 A small HTTP reverse-proxy load balancer built with `aiohttp`.
 
-- **Strategy:** round robin over healthy backends
+- **Strategies:** round robin, least connections, weighted (smooth WRR)
 - **Health checks:** active probing of `/health` every 5 seconds
 - **Failure handling:** passive demotion on upstream errors, `503` if no backend is healthy
 
@@ -49,7 +49,10 @@ Each backend prints its port on startup and serves:
 
 ```bash
 # terminal 4
-python lb.py
+python lb.py                              # default: round-robin
+# or
+python lb.py --strategy least-connections
+python lb.py --strategy weighted          # uses weights from BACKENDS in lb.py
 ```
 
 You should see it bind to `0.0.0.0:8080`. The health-check loop starts immediately and logs any backend state changes.
