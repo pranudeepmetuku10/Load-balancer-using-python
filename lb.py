@@ -168,6 +168,7 @@ async def _probe(backend: Backend, session: ClientSession, timeout: ClientTimeou
             backend.healthy = resp.status == 200
     except (ClientError, asyncio.TimeoutError):
         backend.healthy = False
+    HEALTHY.labels(backend=backend.url).set(1 if backend.healthy else 0)
     if was_healthy != backend.healthy:
         log.info("backend %s -> %s", backend.url, "UP" if backend.healthy else "DOWN")
 
