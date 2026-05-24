@@ -176,20 +176,28 @@ async def _probe(backend: Backend, session: ClientSession, timeout: ClientTimeou
 async def proxy(request: web.Request) -> web.StreamResponse:
     balancer: Strategy = request.app["balancer"]
     session: ClientSession = request.app["session"]
+    strategy_name: str = request.app["strategy_name"]
 
     backend = balancer.pick()
     if backend is None:
+        REQUESTS.labels(backend="none", method=request.method, status="503").inc()
         return web.Response(status=503, text="no healthy backends")
+
+    PICKS.labels(backend=backend.url, strategy=strategy_name).inc()
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
     target = backend.url + request.rel_url.raw_path_qs
     body = await request.read()
 
     backend.active += 1
+    ACTIVE.labels(backend=backend.url).inc()
+    status = 502
+    start = asyncio.get_event_loop().time()
     try:
         async with session.request(
             request.method, target, headers=headers, data=body, allow_redirects=False,
         ) as upstream:
+            status = upstream.status
             resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP}
             response = web.StreamResponse(status=upstream.status, headers=resp_headers)
             await response.prepare(request)
@@ -200,9 +208,18 @@ async def proxy(request: web.Request) -> web.StreamResponse:
     except ClientError as e:
         log.warning("upstream error from %s: %s", backend.url, e)
         backend.healthy = False
+        HEALTHY.labels(backend=backend.url).set(0)
+        ERRORS.labels(backend=backend.url).inc()
         return web.Response(status=502, text=f"bad gateway: {e}")
     finally:
         backend.active -= 1
+        ACTIVE.labels(backend=backend.url).dec()
+        LATENCY.labels(backend=backend.url).observe(asyncio.get_event_loop().time() - start)
+        REQUESTS.labels(backend=backend.url, method=request.method, status=str(status)).inc()
+
+
+async def metrics(request: web.Request) -> web.Response:
+    return web.Response(body=generate_latest(REGISTRY), content_type=CONTENT_TYPE_LATEST.split(";")[0])
 
 
 async def on_startup(app: web.Application) -> None:
@@ -228,7 +245,12 @@ def build_app(strategy_name: str = "round-robin") -> web.Application:
     app["strategy_name"] = strategy_name
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
+    # /metrics is registered before the catch-all so it isn't proxied.
+    app.router.add_get("/metrics", metrics)
     app.router.add_route("*", "/{tail:.*}", proxy)
+    # Initialize health gauges so Prometheus has them on first scrape.
+    for b in backends:
+        HEALTHY.labels(backend=b.url).set(1 if b.healthy else 0)
     return app
 
 
