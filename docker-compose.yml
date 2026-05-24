@@ -1,0 +1,46 @@
+services:
+  backend1:
+    build: .
+    command: ["python", "backend.py", "9000"]
+    expose: ["9000"]
+
+  backend2:
+    build: .
+    command: ["python", "backend.py", "9000"]
+    expose: ["9000"]
+
+  backend3:
+    build: .
+    command: ["python", "backend.py", "9000"]
+    expose: ["9000"]
+
+  lb:
+    build: .
+    command: ["python", "lb.py", "--strategy", "${LB_STRATEGY:-round-robin}"]
+    environment:
+      LB_BACKENDS: "http://backend1:9000=1,http://backend2:9000=2,http://backend3:9000=3"
+    ports:
+      - "8080:8080"
+    depends_on: [backend1, backend2, backend3]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on: [lb]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
