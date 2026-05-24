@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -28,11 +29,26 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8080
 
 # (url, weight). Weight is used only by the weighted strategy; ignored otherwise.
-BACKENDS: list[tuple[str, int]] = [
+# Override via env: LB_BACKENDS="http://host:port=weight,http://host:port=weight"
+DEFAULT_BACKENDS: list[tuple[str, int]] = [
     ("http://localhost:9001", 1),
     ("http://localhost:9002", 2),
     ("http://localhost:9003", 3),
 ]
+
+
+def load_backends() -> list[tuple[str, int]]:
+    raw = os.environ.get("LB_BACKENDS")
+    if not raw:
+        return DEFAULT_BACKENDS
+    out: list[tuple[str, int]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        url, _, w = item.partition("=")
+        out.append((url, int(w) if w else 1))
+    return out
 
 HEALTH_PATH = "/health"
 HEALTH_INTERVAL = 5.0
@@ -237,7 +253,7 @@ async def on_cleanup(app: web.Application) -> None:
 
 
 def build_app(strategy_name: str = "round-robin") -> web.Application:
-    backends = [Backend(url=url, weight=w) for url, w in BACKENDS]
+    backends = [Backend(url=url, weight=w) for url, w in load_backends()]
     strategy_cls = STRATEGIES[strategy_name]
     app = web.Application()
     app["backends"] = backends
@@ -267,5 +283,5 @@ if __name__ == "__main__":
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     log.info("starting LB on %s:%d  strategy=%s  backends=%s",
-             args.host, args.port, args.strategy, [(u, w) for u, w in BACKENDS])
+             args.host, args.port, args.strategy, load_backends())
     web.run_app(build_app(args.strategy), host=args.host, port=args.port, print=None)
