@@ -1,15 +1,19 @@
 # Load Balancer in Python
 
-A small HTTP reverse-proxy load balancer built with `aiohttp`.
+A small HTTP reverse-proxy load balancer built with `aiohttp`, plus a one-command Docker stack with Prometheus + Grafana observability.
 
 - **Strategies:** round robin, least connections, weighted (smooth WRR)
 - **Health checks:** active probing of `/health` every 5 seconds
 - **Failure handling:** passive demotion on upstream errors, `503` if no backend is healthy
+- **Metrics:** `/metrics` endpoint (Prometheus format), scraped and visualized in Grafana
 
 ## Files
 
-- `lb.py` - the load balancer (listens on `:8080`)
+- `lb.py` - the load balancer (listens on `:8080`, metrics on `/metrics`)
 - `backend.py` - a tiny test backend with a `/toggle` route to flip its health on or off
+- `docker-compose.yml` - brings up LB + 3 backends + Prometheus + Grafana
+- `prometheus.yml` - scrape config (5-second interval against the LB)
+- `grafana/` - provisioned datasource and the `Load Balancer` dashboard
 
 ## Requirements
 
@@ -170,10 +174,67 @@ sort /tmp/lb.out | uniq -c
 
 Weighted uses nginx's "smooth" WRR algorithm, so a 1:2:3 weighting produces an interleaved sequence (e.g. `C, B, C, A, B, C, ...`) rather than a bursty `A, B, B, C, C, C` pattern.
 
+## Run the full stack (Docker)
+
+Make sure Docker Desktop is running, then from the project root:
+
+```bash
+docker compose up -d --build
+```
+
+This brings up six containers on one network:
+
+| Service     | Host port | Notes                                         |
+| ----------- | --------- | --------------------------------------------- |
+| `lb`        | 8080      | Load balancer, also exposes `/metrics`        |
+| `backend1`  | -         | Listens internally on `:9000` (weight 1)      |
+| `backend2`  | -         | Listens internally on `:9000` (weight 2)      |
+| `backend3`  | -         | Listens internally on `:9000` (weight 3)      |
+| `prometheus`| 9090      | Scrapes `lb:8080/metrics` every 5 seconds     |
+| `grafana`   | 3000      | Anonymous admin access (no login prompt)      |
+
+Switch strategy without editing files:
+
+```bash
+LB_STRATEGY=weighted docker compose up -d
+LB_STRATEGY=least-connections docker compose up -d
+```
+
+### Generate load and watch the dashboard
+
+In one terminal, drive a sustained load:
+
+```bash
+while true; do curl -s localhost:8080/ > /dev/null; done
+```
+
+Open Grafana at <http://localhost:3000> (anonymous admin is enabled) and click into the `Load Balancer` dashboard. You should see:
+
+- **Request rate by backend** - per-backend req/s
+- **Proxy latency p50 / p95** - via Prometheus histogram quantiles
+- **In-flight requests** - the same counter that drives `--strategy least-connections`
+- **Backend health** - green/red stat panel, flips when you toggle a backend
+- **Backend pick rate** - which backend the strategy chose (this is where weighted vs round-robin becomes visually obvious)
+- **Response status codes** - 2xx vs 5xx breakdown
+
+To prove the weighting visually, restart with `LB_STRATEGY=weighted` and observe that `backend3` (weight 3) gets ~3x the picks of `backend1` (weight 1).
+
+Tear it down with:
+
+```bash
+docker compose down
+```
+
 ## Configuration
 
 Edit the constants at the top of `lb.py`:
 
 - `LISTEN_HOST`, `LISTEN_PORT` - where the LB listens
-- `BACKENDS` - list of `(url, weight)` tuples; weight is only used by `--strategy weighted`
+- `DEFAULT_BACKENDS` - list of `(url, weight)` tuples; weight is only used by `--strategy weighted`
 - `HEALTH_PATH`, `HEALTH_INTERVAL`, `HEALTH_TIMEOUT` - probing behavior
+
+You can also override the backend list at runtime without editing code:
+
+```bash
+LB_BACKENDS="http://a:9000=1,http://b:9000=2,http://c:9000=3" python lb.py --strategy weighted
+```
