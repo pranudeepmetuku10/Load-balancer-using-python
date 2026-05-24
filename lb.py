@@ -15,6 +15,14 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8080
@@ -37,6 +45,38 @@ HOP_BY_HOP = frozenset({
 })
 
 log = logging.getLogger("lb")
+
+# --- Prometheus metrics -----------------------------------------------------
+REQUESTS = Counter(
+    "lb_requests_total",
+    "Requests forwarded by the load balancer.",
+    ["backend", "method", "status"],
+)
+LATENCY = Histogram(
+    "lb_request_duration_seconds",
+    "End-to-end proxy latency per backend.",
+    ["backend"],
+)
+ACTIVE = Gauge(
+    "lb_active_requests",
+    "In-flight requests currently being proxied.",
+    ["backend"],
+)
+HEALTHY = Gauge(
+    "lb_backend_healthy",
+    "1 if the backend is currently healthy, else 0.",
+    ["backend"],
+)
+PICKS = Counter(
+    "lb_picks_total",
+    "Times the balancer selected a given backend.",
+    ["backend", "strategy"],
+)
+ERRORS = Counter(
+    "lb_upstream_errors_total",
+    "Upstream errors hitting a backend (network failures, 5xx are NOT counted here).",
+    ["backend"],
+)
 
 
 @dataclass
